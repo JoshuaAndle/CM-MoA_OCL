@@ -294,11 +294,14 @@ class ResidualAttentionBlock_MoA(ResidualAttentionBlock):
 
         self.top_k = design_details.get('top_k', 2)
         self.ffn_num = design_details.get('ffn_num', 64)
-        self.experts_num = design_details.get('experts_num', 4)
-        # print("Experts num: ", self.experts_num)
         self.noisy_gating = design_details.get('noisy_gating', True)
         self.task_count = design_details.get("number_tasks", )
 
+        ### Initial number of experts, and number added/frozen for each task
+        self.experts_num = design_details.get('experts_num', 4)
+        self.experts_per_task = design_details.get('experts_per_task', 4)
+        # print("Experts num: ", self.experts_num)
+        
         self.softmax = nn.Softmax(1)
         self.softplus = nn.Softplus()
         self.register_buffer("mean", torch.tensor([0.0]))
@@ -326,21 +329,47 @@ class ResidualAttentionBlock_MoA(ResidualAttentionBlock):
                                     )
             self.adaptmlp_list.append(self.adaptmlp)
 
-    ### Add a new router at the start of each new task
-    def init_router(self):
-        self.router_list.append(nn.Parameter(torch.zeros(self.d_model, self.experts_num), requires_grad=True))
-        self.w_noise_list.append(nn.Parameter(torch.zeros(self.d_model, self.experts_num), requires_grad=True))
+    ### Add a new router and adapters when initializing a new subnetwork
+    def init_subnet(self, subnet):
+        self.init_expert(self.experts_per_task)
+        self.router_list.append(nn.Parameter(torch.zeros(self.d_model, len(self.adaptmlp_list)), requires_grad=True))
+        self.w_noise_list.append(nn.Parameter(torch.zeros(self.d_model, len(self.adaptmlp_list)), requires_grad=True))
 
     def init_expert(self, num_experts_added=1):
-        # for i in num_experts_added:
-        #     self.adaptmlp = Adapter(d_model=self.d_model, dropout=0.1, bottleneck=self.ffn_num,
-        #                                 init_option='lora',
-        #                                 adapter_scalar=0.1,
-        #                                 adapter_layernorm_option='none',
-        #                                 )
-        #     self.adaptmlp_list.append(self.adaptmlp)
-        #     self.experts_num += 1
-        pass
+        ### Add new experts to accomodate learning new task
+        for i in range(num_experts_added):
+            self.adaptmlp = Adapter(d_model=self.d_model, dropout=0.1, bottleneck=self.ffn_num,
+                                        init_option='lora',
+                                        adapter_scalar=0.1,
+                                        adapter_layernorm_option='none',
+                                        )
+            self.adaptmlp_list.append(self.adaptmlp)
+            self.experts_num += 1
+
+        ### Extend existing routers to account for new experts
+        #!# Note that extending routers this way resets gradient data. This is fairly negligible, and for now we dont go back to retrain existing routers
+        for i in range(len(self.router_list)):
+            original_router = self.router_list[i].data 
+            original_noise  = self.w_noise_list[i].data
+
+            # new_experts = len(self.adaptmlp_list) - original_router.shape[1]
+            extended_router = nn.Parameter(torch.zeros(self.d_model, len(self.adaptmlp_list)), requires_grad=True)
+            extended_noise = nn.Parameter(torch.zeros(self.d_model, len(self.adaptmlp_list)), requires_grad=True)
+
+            extended_router.data[:, :original_router.shape[1]] = original_router.data
+            extended_noise.data[:, :original_noise.shape[1]] = original_noise.data
+
+            self.router_list[i] = extended_router
+            self.w_noise_list[i] = extended_noise
+
+
+        ### Reset choose maps, both to extend and to consider only counts for current subnetwork
+        if self.modal == 'text':
+            self.choose_map_text = torch.zeros([len(self.adaptmlp_list)])
+        else:
+            self.choose_map_image = torch.zeros([len(self.adaptmlp_list)])
+
+
 
     ### Implement merging of similarly functioning experts to consolidate adapters
     def merge_experts(self):
@@ -469,7 +498,8 @@ class ResidualAttentionBlock_MoA(ResidualAttentionBlock):
                 gates, load = self.noisy_top_k_gating(x_re, is_train, self.router_list[global_subnet_id], self.w_noise_list[global_subnet_id])
             importance = gates.sum(0)
 
-            #!# Note: Original MoE-Adapter author never implemented a penalty for this loss, should try for enforced expert diversity
+            #!# Note: Original MoE-Adapter author never implemented a penalty for this loss
+            #!# Not sure we want to either, as we ideally want to partition certain experts to specific subnetworks with less sharing
             loss = self.cv_squared(importance) + self.cv_squared(load)
             loss *= 1e-2 # # Todo
 

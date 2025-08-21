@@ -43,7 +43,8 @@ class MoACLIP(nn.Module):
             'peft_encoder': peft_encoder,
             'ffn_num': 64,
             'lora_alpha': 1,
-            'lora_r': 4
+            'lora_r': 4,
+            'experts_per_task': 4
         }
 
         self.clip_model = clip_loader.load(model_name, device=self.device, jit=False, design_details=design_details)

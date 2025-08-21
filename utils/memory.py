@@ -19,6 +19,9 @@ class Memory:
         self.memory_per_class = -1
         self.seen = {}
 
+        self.current_task = -1
+        self.classes_by_task = {}
+
         self.memory = torch.empty(0)
         self.labels = torch.empty(0)
         self.cls_list = torch.empty(0)
@@ -28,12 +31,18 @@ class Memory:
         self.others_loss_decrease = torch.empty(0)
 
 
+    def set_task(self, task_id):
+        if task_id not in self.classes_by_task.keys():
+            self.classes_by_task[task_id] = []
+        self.current_task = task_id
+
     ### Note: cls_list is not necessarily ordered as increasing or contiguous integers
     def add_new_class(self, cls_list: Iterable[int]) -> None:
         self.cls_list = torch.tensor(cls_list)
         # print("Resulting class list in memory: ", self.cls_list)
         for cls in cls_list:
             if cls not in self.cls_count.keys():
+                self.classes_by_task[self.current_task].append(cls)
                 self.cls_count[cls] = 0
             # if cls.item() not in self.cls_train_cnt.keys():
                 self.cls_train_cnt[cls] = 0
@@ -164,6 +173,44 @@ class DummyMemory(Memory):
         self.cls_count = {}
         self.cls_train_cnt = {}
         self.others_loss_decrease = torch.zeros(self.datasize)
+
+
+
+
+class MemorySubnetBatchSampler(torch.utils.data.Sampler):
+    def __init__(self, memory: Memory, batch_size: int, iterations: int = 1, tasks: list = []) -> None:
+        self.memory = memory
+        self.batch_size = batch_size
+        self.iterations = int(iterations)
+
+        valid_classes = []
+        for task in tasks:
+            valid_classes.extend(self.memory.classes_by_task[task])
+        ### Get a random shuffle of only the labels corresponding to the given subnetwork, if one is given
+        if len(valid_classes) > 0:
+            valid_indices = torch.isin(self.memory.labels, torch.tensor(valid_classes))
+            valid_indices = valid_indices.nonzero(as_tuple=True)[0]
+            print("Number of valid indices for subnetwork tasks {} in memory: {}".format(tasks, len(valid_indices)))
+            rand_indices = torch.randperm(len(valid_indices), dtype=torch.int64)
+            shuffled_indices = valid_indices[rand_indices]
+        else:
+            shuffled_indices = torch.randperm(len(self.memory), dtype=torch.int64)
+
+
+        self.indices = torch.cat([shuffled_indices[:min(self.batch_size, len(self.memory))] for _ in range(self.iterations)]).tolist()
+        for i, idx in enumerate(self.indices):
+            self.indices[i] = int(self.memory.memory[idx])
+    
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self):
+        return len(self.indices)
+    
+
+
+
+
 
 
 class MemoryBatchSampler(torch.utils.data.Sampler):
