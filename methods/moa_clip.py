@@ -19,7 +19,7 @@ import torchvision.models as models
 
 from methods._trainer import _Trainer
 from utils.train_utils import select_optimizer, select_scheduler, exp_lr_scheduler
-from utils.memory import Memory, MemoryBatchSampler
+from utils.memory import Memory, MemoryBatchSampler, MemorySubnetBatchSampler
 # from utils.memory import MemoryBatchSampler
 
 from models.AutoEncoder import AutoEncoder, Alexnet_FE
@@ -39,7 +39,7 @@ class MoACLIP(_Trainer):
 
         ### Track which experts have been frozen and which have been assigned to each task
         # self.frozen_experts = {"text":{}, "visual":{}}
-        self.experts_by_task = {}
+        self.experts_by_subnet = {}
         self.autoencoders = {}
         self.optimizer_encoder = None
 
@@ -52,57 +52,67 @@ class MoACLIP(_Trainer):
 
         self.batch_counter = 0
 
-
+        self.subnet = -1
         self.task_by_subnet = {}
 
 
     
+    def merge_subnetworks(self, task_id):
+        pass
+
     def select_subnet(self, task_id):
+        subnetwork = -1
         for subnet, task_list in self.task_by_subnet.items():
             print("Checking subnet {} and task_list {}".format(subnet, task_list))
             if task_id in task_list:
+                subnetwork = subnet
+        
         if len(self.task_by_subnet.keys()) == 0:
-            subnet = 0
+            subnetwork = 0
             self.task_by_subnet[0] = [task_id]
-        else:
-            subnet = max(self.task_by_subnet.keys()) + 1
-            self.task_by_subnet[subnet] = [task_id]
+        elif subnetwork == -1:
+            subnetwork = max(self.task_by_subnet.keys()) + 1
+            self.task_by_subnet[subnetwork] = [task_id]
 
-        print("Selecting subnetwork: ", subnet, " for task ID: ", task_id)
-        return subnet
+        print("Selecting subnetwork: ", subnetwork, " for task ID: ", task_id)
+        return subnetwork
 
 
     ### Prior to task, set task ID in model and initialize new expert mask, task routers, and task autoencoder
     def online_before_task(self, task_id):
         ### Deferred assignment since self.device isnt set up at init
         self.feature_extractor.to(self.device)
-        subnet = self.select_subnet(task_id)
 
-        ### Add a memory buffer for the new task and set it as the active buffer
-        # self.memory_by_task[task_id] = Memory()
-        # self.memory = self.memory_by_task[task_id]
-
-        self.model.clip_model.set_subnet(subnet)
         self.autoencoders[task_id] = AutoEncoder()
         self.optimizer_encoder = optim.Adam(self.autoencoders[task_id].parameters(), lr=0.003, weight_decay=0.0001)
 
-        self.experts_by_task[task_id] = {"text":{}, "visual":{}}
-        for i in range(len(self.model.clip_model.visual.transformer.resblocks)):
-            self.experts_by_task[task_id]['text'][i] = []
-            self.experts_by_task[task_id]['visual'][i] = []
-            ### Set up new routers for new task in all transformer residual blocks
-            self.model.clip_model.visual.transformer.resblocks[i].init_router()
-            self.model.clip_model.transformer.resblocks[i].init_router()
+
+        subnet = self.select_subnet(task_id)
+        self.subnet = subnet
+        self.memory.set_task(task_id)
+        self.model.clip_model.set_subnet(subnet)
+
+        ### Add experts and router for new task and corresponding dictionary entries to track subnetwork-dedicated experts
+        if subnet not in self.experts_by_subnet.keys():
+            self.experts_by_subnet[subnet] = {"text":{}, "visual":{}}
+            for i in range(len(self.model.clip_model.visual.transformer.resblocks)):
+                self.experts_by_subnet[subnet]['text'][i] = []
+                self.experts_by_subnet[subnet]['visual'][i] = []
+                ### Set up new routers for new task in all transformer residual blocks
+                self.model.clip_model.visual.transformer.resblocks[i].init_subnet(subnet)
+                self.model.clip_model.transformer.resblocks[i].init_subnet(subnet)
+    
+            self.model.to(self.device)
 
 
-        ### Produce a list of all experts frozen for tasks other than the current one
+        ### Produce a list of all experts frozen for subnetworks other than the current one
         frozen_experts = []
-        for key in self.experts_by_task.keys():
+        for key in self.experts_by_subnet.keys():
             ### This prevents revisited tasks from training experts frozen in later tasks, alternatively may want to use "key < task_id"
-            if key != task_id:
+            if key != subnet:
                 for modal in ["text", "visual"]:
-                    for block in self.experts_by_task[key][modal].keys():
-                        frozen_experts.extend(self.experts_by_task[key][modal][block])
+                    for block in self.experts_by_subnet[key][modal].keys():
+                        frozen_experts.extend(self.experts_by_subnet[key][modal][block])
         print("The number of frozen experts is: ", len(frozen_experts))
         # print("The list of frozen experts is: ", frozen_experts)
 
@@ -140,19 +150,20 @@ class MoACLIP(_Trainer):
             top_values_t, top_indices_t = torch.topk(text_choose_map, 2)
 
             for j in range(len(top_indices_v)):
-                self.experts_by_task[task_id]["visual"][i].append('visual.transformer.resblocks.{}.adaptmlp_list.{}.down_proj.weight'.format(i,top_indices_v[j]))
-                self.experts_by_task[task_id]["visual"][i].append('visual.transformer.resblocks.{}.adaptmlp_list.{}.down_proj.bias'.format(i,top_indices_v[j]))
-                self.experts_by_task[task_id]["visual"][i].append('visual.transformer.resblocks.{}.adaptmlp_list.{}.up_proj.weight'.format(i,top_indices_v[j]))
-                self.experts_by_task[task_id]["visual"][i].append('visual.transformer.resblocks.{}.adaptmlp_list.{}.up_proj.bias'.format(i,top_indices_v[j]))
+                self.experts_by_subnet[self.subnet]["visual"][i].append('visual.transformer.resblocks.{}.adaptmlp_list.{}.down_proj.weight'.format(i,top_indices_v[j]))
+                self.experts_by_subnet[self.subnet]["visual"][i].append('visual.transformer.resblocks.{}.adaptmlp_list.{}.down_proj.bias'.format(i,top_indices_v[j]))
+                self.experts_by_subnet[self.subnet]["visual"][i].append('visual.transformer.resblocks.{}.adaptmlp_list.{}.up_proj.weight'.format(i,top_indices_v[j]))
+                self.experts_by_subnet[self.subnet]["visual"][i].append('visual.transformer.resblocks.{}.adaptmlp_list.{}.up_proj.bias'.format(i,top_indices_v[j]))
             for k in range(len(top_indices_t)):
-                self.experts_by_task[task_id]["text"][i].append('transformer.resblocks.{}.adaptmlp_list.{}.down_proj.weight'.format(i, top_indices_t[k]))
-                self.experts_by_task[task_id]["text"][i].append('transformer.resblocks.{}.adaptmlp_list.{}.down_proj.bias'.format(i, top_indices_t[k]))
-                self.experts_by_task[task_id]["text"][i].append('transformer.resblocks.{}.adaptmlp_list.{}.up_proj.weight'.format(i, top_indices_t[k]))
-                self.experts_by_task[task_id]["text"][i].append('transformer.resblocks.{}.adaptmlp_list.{}.up_proj.bias'.format(i, top_indices_t[k]))
+                self.experts_by_subnet[self.subnet]["text"][i].append('transformer.resblocks.{}.adaptmlp_list.{}.down_proj.weight'.format(i, top_indices_t[k]))
+                self.experts_by_subnet[self.subnet]["text"][i].append('transformer.resblocks.{}.adaptmlp_list.{}.down_proj.bias'.format(i, top_indices_t[k]))
+                self.experts_by_subnet[self.subnet]["text"][i].append('transformer.resblocks.{}.adaptmlp_list.{}.up_proj.weight'.format(i, top_indices_t[k]))
+                self.experts_by_subnet[self.subnet]["text"][i].append('transformer.resblocks.{}.adaptmlp_list.{}.up_proj.bias'.format(i, top_indices_t[k]))
 
 
 
-
+    if len(self.task_by_subnet.keys()) > self.args.max_subnets:
+        self.merge_subnetworks()
 
 
 
@@ -172,8 +183,8 @@ class MoACLIP(_Trainer):
 
 
 
-        self.memory_sampler = MemoryBatchSampler(self.memory, self.memory_batchsize,
-                                    self.temp_batchsize * self.online_iter * self.world_size)
+        self.memory_sampler = MemorySubnetBatchSampler(self.memory, self.memory_batchsize,
+                                    self.temp_batchsize * self.online_iter * self.world_size, self.task_by_subnet[self.subnet])
         self.memory_dataloader = DataLoader(self.train_dataset,
                                             batch_size=self.memory_batchsize,
                                             sampler=self.memory_sampler,
@@ -280,48 +291,52 @@ class MoACLIP(_Trainer):
 
         ### If there is a memory buffer, we also do a batch of memory samples
         ### We do this in two passes rather than concatenate batches since datasets may have incompatible sizes of images
-
-
         if len(self.memory) > 0 and self.memory_batchsize > 0:
-            x_mem, y_mem = next(self.memory_provider)
-            for i in y_mem.unique():
-                if i not in train_class_list:
-                    train_class_list.append(i)
-                    train_class_name_list.append(self.exposed_classes_names[self.exposed_classes.index(i)])
+            ### Note: Added as memory may be empty or nearly empty at start of tasks
+            try:
+                x_mem, y_mem = next(self.memory_provider)
+            except StopIteration:
+                x_mem, y_mem = None, None
+
+            if x_mem is not None:            
+                for i in y_mem.unique():
+                    if i not in train_class_list:
+                        train_class_list.append(i)
+                        train_class_name_list.append(self.exposed_classes_names[self.exposed_classes.index(i)])
 
 
-            ### My understanding is this is making a contiguous set of class labels using the indices of train_class_list
-            for j in range(len(y_mem)):
-                y_mem[j] = train_class_list.index(y_mem[j].item())
+                ### My understanding is this is making a contiguous set of class labels using the indices of train_class_list
+                for j in range(len(y_mem)):
+                    y_mem[j] = train_class_list.index(y_mem[j].item())
 
-            x_mem, y_mem = x_mem.to(self.device), y_mem.to(self.device)
-            x_mem = self.train_transform(x_mem)
-
-
-
-            ### Update tokens to reflect potential newly added classes from memory buffer
-            text_tokens = self.model.labels_tokenize(train_class_name_list)
+                x_mem, y_mem = x_mem.to(self.device), y_mem.to(self.device)
+                x_mem = self.train_transform(x_mem)
 
 
-            
 
-            ### Train clip model adapters
-            # with torch.cuda.amp.autocast(enabled=self.use_amp):
-            with torch.amp.autocast('cuda', enabled=self.use_amp):            
-                logit, image_features, text_features = self.model(x_mem, text_tokens)
-                loss = self.criterion(logit, y_mem)
-            _, preds = logit.topk(self.topk, 1, True, True)
-
-            ### Accumulate gradients with the online batch and memory batch before zeroing again
-            # self.optimizer.zero_grad()
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+                ### Update tokens to reflect potential newly added classes from memory buffer
+                text_tokens = self.model.labels_tokenize(train_class_name_list)
 
 
-            total_loss += loss.item()
-            total_correct += torch.sum(preds == y_mem.unsqueeze(1)).item()
-            total_num_data += y_mem.size(0)
+                
+
+                ### Train clip model adapters
+                # with torch.cuda.amp.autocast(enabled=self.use_amp):
+                with torch.amp.autocast('cuda', enabled=self.use_amp):            
+                    logit, image_features, text_features = self.model(x_mem, text_tokens)
+                    loss = self.criterion(logit, y_mem)
+                _, preds = logit.topk(self.topk, 1, True, True)
+
+                ### Accumulate gradients with the online batch and memory batch before zeroing again
+                # self.optimizer.zero_grad()
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+
+
+                total_loss += loss.item()
+                total_correct += torch.sum(preds == y_mem.unsqueeze(1)).item()
+                total_num_data += y_mem.size(0)
 
 
         self.update_schedule()
