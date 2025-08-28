@@ -408,7 +408,7 @@ class _Trainer():
             running_train_loss, running_train_acc = 0., 0.
             for i, (images, labels, idx) in enumerate(self.train_dataloader):
                 ### Break after the first 500 samples of training data if debugging
-                if self.debug and (i + 1) * self.temp_batchsize >= 500:
+                if self.debug and (i + 1) * self.temp_batchsize >= 200:
                     break
                 samples_cnt += images.size(0) * self.world_size
 

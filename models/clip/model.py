@@ -329,6 +329,48 @@ class ResidualAttentionBlock_MoA(ResidualAttentionBlock):
                                     )
             self.adaptmlp_list.append(self.adaptmlp)
 
+
+
+
+
+    def merge_subnets(self, subnet_list, experts_to_remove, verbose=False):
+        """
+        Given multiple subnetworks to be merged and a list of lists for the experts belonging to each
+        Remove all subnetwork routers except for the first in subnet_list, which will be finetuned to cover all merged tasks
+        Remove experts belonging to all bust the first subnetwork in subnet_list, which will be finetuned to cover the role for all merged tasks
+        Need to downsize remaining routers to reflect expert removal
+        """
+        if verbose:
+            print("Merging Subnetworks in adapter layer")
+            print("Pre-merge layer has {} adapters and {} routers. Removing experts: {}".format(len(self.adaptmlp_list), len(self.router_list), experts_to_remove))
+            print("Pre-merge size of router: ", self.router_list[0].data.size())
+
+        ### Remove the routers of subnetworks being merged:
+        remaining_subnets = [i for i in range(len(self.router_list)) if i not in subnet_list[1:]]
+        self.router_list = nn.ParameterList([self.router_list[i] for i in remaining_subnets])
+        self.w_noise_list = nn.ParameterList([self.w_noise_list[i] for i in remaining_subnets])
+
+
+        ### Downsize the routers to account for removal of experts deemed redundant
+        remaining_experts = [i for i in range(len(self.adaptmlp_list)) if i not in experts_to_remove]
+        for idx in range(len(self.router_list)):
+            reduced_data = self.router_list[idx].data[:,remaining_experts]
+            self.router_list[idx] = nn.Parameter(reduced_data, requires_grad=True)
+
+            reduced_noise_data = self.w_noise_list[idx].data[:,remaining_experts]
+            self.w_noise_list[idx] = nn.Parameter(reduced_noise_data, requires_grad=True)
+
+        ### Remove redundant experts
+        self.adaptmlp_list = nn.ModuleList([self.adaptmlp_list[i] for i in remaining_experts])
+        self.experts_num -= len(experts_to_remove)
+
+        if verbose:
+            print("Post-merge layer has {} adapters and {} routers. Removing experts: {}".format(len(self.adaptmlp_list), len(self.router_list), experts_to_remove))
+            print("Post-merge size of router: ", self.router_list[0].data.size())
+            print("Resulting experts_num: ", self.experts_num)
+
+
+
     ### Add a new router and adapters when initializing a new subnetwork
     def init_subnet(self, subnet):
         self.init_expert(self.experts_per_task)

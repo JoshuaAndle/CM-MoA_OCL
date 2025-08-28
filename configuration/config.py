@@ -14,6 +14,8 @@ def base_parser():
     parser.add_argument("--rnd_NM", action='store_true', default=False, help="if True, N and M are randomly mixed over tasks.")
     parser.add_argument("--rnd_seed", type=int, help="Random seed number.")
     parser.add_argument("--memory_size", type=int, default=500, help="Episodic memory size")
+
+
     # Dataset
     parser.add_argument("--log_path", type=str, default="results", help="The path logs are saved.", )
     parser.add_argument("--per_task_datasets", action="store_true", help="True if each task is a separate dataset")
@@ -105,6 +107,10 @@ def base_parser():
     parser.add_argument("--zero_shot_evaluation", action='store_true', default=False, help="if True, will do zero-shot evaluation.")
     parser.add_argument('--zero_shot_dataset', nargs='+', type=str, default=["food101", "caltech101", "eurosat", "flowers102", "oxford_pet"], 
                                 help='Which dataset to use for zero-shot evaluation.')
+
+    # Cluster and Merge
+    parser.add_argument("--max_subnets", type=int, default=2, help="Max subnets allowed before merging")
+
 
     args = parser.parse_args()
     return args
