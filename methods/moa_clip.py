@@ -36,10 +36,12 @@ class MoACLIP(_Trainer):
         self.batch_exposed_classes = []
         self.batch_exposed_classes_names = []
         self.visible_classes = self.args.get('visible_classes', 'batch')
+        self.max_subnets = self.args.get("max_subnets")
 
         ### Track which experts have been frozen and which have been assigned to each task
         # self.frozen_experts = {"text":{}, "visual":{}}
         self.experts_by_subnet = {}
+        self.experts_index_by_subnet = {}
         self.autoencoders = {}
         self.optimizer_encoder = None
 
@@ -53,26 +55,251 @@ class MoACLIP(_Trainer):
         self.batch_counter = 0
 
         self.subnet = -1
-        self.task_by_subnet = {}
+        self.tasks_by_subnet = {}
 
 
-    
-    def merge_subnetworks(self, task_id):
+
+
+
+
+
+
+    def merge_subnetworks(self, clustered_subnets):
+        ### Add experts and router for new task and corresponding dictionary entries to track subnetwork-dedicated experts
+        subnets_to_remove = []
+        for i in range(1, len(clustered_subnets)):
+            subnets_to_remove.append(clustered_subnets[i])
+
+        print("\n\n\n")
+        print("-"*20)
+        print("Merging Subnetworks ", clustered_subnets)
+        print("Pre-merge tasks by subnet: {}".format(self.tasks_by_subnet))
+        print("Pre-merge values of dicts for 1st visual block of model:")
+        for subnet in self.tasks_by_subnet.keys():
+            print("Expert Indices for subnet {}: {}".format(subnet, self.experts_index_by_subnet[subnet]["visual"][0]))
+
+        print("")
+        for subnet in self.tasks_by_subnet.keys():
+            print("Expert names for subnet {}: {}".format(subnet, self.experts_by_subnet[subnet]["visual"][0]))
+
+
+
+
+
+        ### Before updating dicts, we modify the CLIP adapters and routers to maintain consistent IDs after merging
+        experts_to_remove = {"text":{}, "visual":{}}
+        for i in range(len(self.model.clip_model.visual.transformer.resblocks)):
+            ### Get the frozen experts corresponding to the subnetworks being merged 
+            #!# Note: current setup merges all subnetworks into the 1st in the cluster, but alternative merging approaches may be implemented later
+            experts_to_remove["text"][i], experts_to_remove["visual"][i] = [], []
+            for subnet in subnets_to_remove:
+                experts_to_remove["visual"][i].extend(self.experts_index_by_subnet[subnet]["visual"][i])
+                experts_to_remove["text"][i].extend(self.experts_index_by_subnet[subnet]["text"][i])
+
+            experts_to_remove['visual'][i].sort()
+            experts_to_remove['text'][i].sort()
+
+            self.model.clip_model.visual.transformer.resblocks[i].merge_subnets(clustered_subnets, experts_to_remove["visual"][i], verbose=(i<3))
+            self.model.clip_model.transformer.resblocks[i].merge_subnets(clustered_subnets, experts_to_remove["text"][i], verbose=(i<3))
+
+
+
+
+
+        ### Remove subnets being merged from dicts
+        ### experts_index_by_subnet, experts_by_subnet, task_by_subnet
+        for subnet in subnets_to_remove:
+            if subnet in self.experts_index_by_subnet.keys():
+                del self.experts_index_by_subnet[subnet]
+            if subnet in self.experts_by_subnet.keys():
+                del self.experts_by_subnet[subnet]
+            if subnet in self.tasks_by_subnet.keys():
+                ### Passes responsibility of the merged tasks to the subnetwork being merged into
+                self.tasks_by_subnet[clustered_subnets[0]].extend(self.tasks_by_subnet[subnet])
+                del self.tasks_by_subnet[subnet]
+
+
+
+        ### Remap subnet IDs to be contiguous
+        offset = 0
+        for subnet in range(max(list(self.tasks_by_subnet.keys())) + 1):
+            if subnet in subnets_to_remove:
+                offset += 1
+            else:
+                if offset > 0:
+                    self.tasks_by_subnet[subnet-offset] = self.tasks_by_subnet[subnet]
+                    self.experts_by_subnet[subnet-offset] = self.experts_by_subnet[subnet]
+                    self.experts_index_by_subnet[subnet-offset] = self.experts_index_by_subnet[subnet]
+                    del self.tasks_by_subnet[subnet]
+                    del self.experts_by_subnet[subnet]
+                    del self.experts_index_by_subnet[subnet]
+
+
+
+        print("experts_to_remove: ", experts_to_remove)
+
+        ### Offset all dicts to reflect new expert IDs
+        ### Note: End result is all subnet and expert IDs are contiguous integers to match the list indexing used in the CLIP model
+        #*# Might be a more concise way to code this, but its functional and negligible in terms of runtime
+        for subnet in self.experts_index_by_subnet.keys():
+            for mode in ['text', 'visual']:
+                for block in self.experts_index_by_subnet[subnet][mode].keys():
+            
+                    offset = 0
+                    temp_expert_name_list, temp_index_list = [], []
+                    for expert in self.experts_index_by_subnet[subnet][mode][block]:
+                        ### Offset IDs and skip if the expert is being removed
+                        print("Checking expert {} against experts to remove: {}".format(expert, experts_to_remove[mode][block]))
+                        for removed_expert in experts_to_remove[mode][block]:
+                            if expert > removed_expert:
+                                print("Removing, incrementing offset")
+                                offset += 1
+
+                        if expert in experts_to_remove[mode][block]:
+                            continue
+
+                        elif mode == "visual":
+                            temp_index_list.append(expert-offset)
+                            temp_expert_name_list.append('visual.transformer.resblocks.{}.adaptmlp_list.{}.down_proj.weight'.format(block,expert-offset))
+                            temp_expert_name_list.append('visual.transformer.resblocks.{}.adaptmlp_list.{}.down_proj.bias'.format(block,expert-offset))
+                            temp_expert_name_list.append('visual.transformer.resblocks.{}.adaptmlp_list.{}.up_proj.weight'.format(block,expert-offset))
+                            temp_expert_name_list.append('visual.transformer.resblocks.{}.adaptmlp_list.{}.up_proj.bias'.format(block,expert-offset))
+
+
+                        elif mode == "text":
+                            temp_index_list.append(expert-offset)
+                            temp_expert_name_list.append('transformer.resblocks.{}.adaptmlp_list.{}.down_proj.weight'.format(block,expert-offset))
+                            temp_expert_name_list.append('transformer.resblocks.{}.adaptmlp_list.{}.down_proj.bias'.format(block,expert-offset))
+                            temp_expert_name_list.append('transformer.resblocks.{}.adaptmlp_list.{}.up_proj.weight'.format(block,expert-offset))
+                            temp_expert_name_list.append('transformer.resblocks.{}.adaptmlp_list.{}.up_proj.bias'.format(block,expert-offset))
+
+
+                    self.experts_index_by_subnet[subnet][mode][block] = temp_index_list
+                    self.experts_by_subnet[subnet][mode][block] = temp_expert_name_list
+
+
+
+        print("\n\n\nPost-merge tasks by subnet: {}".format(self.tasks_by_subnet))
+        print("Post-merge values of dicts for 1st visual block of model:")
+        for subnet in self.tasks_by_subnet.keys():
+            print("Expert Indices for subnet {}: {}".format(subnet, self.experts_index_by_subnet[subnet]["visual"][0]))
+
+        print("")
+        for subnet in self.tasks_by_subnet.keys():
+            print("Expert names for subnet {}: {}".format(subnet, self.experts_by_subnet[subnet]["visual"][0]))
+
+
+        print("-"*20)
+
+
+
+
+
+
+    #!# Currently a placeholder to test merging, simply clusters odd and even subnets
+    def cluster_subnetworks_by_conns(self):
+        clusters = []
+        for subnet in self.tasks_by_subnet.keys():
+            if subnet % 2 == 0:
+                clusters.append(0)
+            else:
+                clusters.append(1)
+        print("Clusters for subnets {}: {}".format(self.tasks_by_subnet.keys(), clusters))
+        return clusters
+
+    def finetune_subnets(self, subnet):
         pass
+
+    ### Cluster the subnetworks by connectivity with KNN clustering, then merge as needed to have K subnetworks
+    def cluster_and_merge(self):
+        
+        """
+        1. Cluster subnetworks by some metric
+        2. For each cluster, go through and merge subnetworks for the:
+            a. Adapter layers
+                i. Routers
+                ii. Noises
+                iii. Experts
+                iv. Frozen expert dictionary entries (to account for offsets and store new subnetwork experts for merged subnet)
+            b. Method dictionary
+        3. Finetune any merged subnetworks on corresponding buffer data
+            a. Need to finetune merged router to learn a weighted combination for the allowed experts while freezing routing to other experts
+            b. Need to finetune the merged experts in one of a few possible ways:
+                i. Selectively remove a subset of the clustered experts to reduce to the allowed per-subnet number
+                ii. Enforce diminishing weights in the router for a subset of the experts during finetuning until they reach 0, then remove those experts
+                iii. Naively initialize and retrain new experts for the merged subnetwork on the buffer data
+        """
+
+        print("\n\n\nClustering")
+        clusters = self.cluster_subnetworks_by_conns()
+        # print("Clusters collected")
+        # numclusters = self.args.clusterNum
+        numclusters = max(clusters)+1
+        subnets_by_cluster = {}
+
+        ### for each cluster, go through all subnetworks and if multiple subnetworks are in the cluster, merge them
+        ### To avoid changing the number of subnetworks while looping, first we just get the indices of mergeable subnetworks
+        for c in range(numclusters):
+            subnets_by_cluster[c] = []
+            
+        
+        
+        
+        for i,cluster in enumerate(clusters):
+            subnets_by_cluster[cluster].append(list(self.tasks_by_subnet.keys())[i])
+        print("subnets_by_cluster: ", subnets_by_cluster, flush=True)                   
+        # self.eval_dicts['mergehistory'][self.taskNum] = subnets_by_cluster.copy()   
+        
+        
+        print("\n\n\nMerging")
+        ### Merge any clusters with more than one subnetwork
+        for c in range(numclusters):
+            if len(subnets_by_cluster[c])>1:
+                merged_subnets = subnets_by_cluster[c]
+                self.merge_subnetworks(merged_subnets)                
+                
+                if self.subnet in merged_subnets:
+                    self.subnet = merged_subnets[0]
+
+                self.finetune_subnets(merged_subnets[0])
+
+
+
+                ### Offset ubnetwork IDs in remaining clusters to reflect updated values after merging
+                for i in range(c+1, numclusters):
+                    if len(subnets_by_cluster[i]) > 1:
+                        for idx, j in enumerate(subnets_by_cluster[i]):
+                            offset = 0
+                            ### Increase offset for every removed subnetwork with an ID lower than the given subnet (first subnet in each cluster is not removed)
+                            for k in merged_subnets[1:]:
+                                if k < j:
+                                    offset += 1
+                            subnets_by_cluster[i][idx] -= offset
+
+                print("Updated cluster values: ", subnets_by_cluster)
+                
+
+
+
+
+
+
+
+
 
     def select_subnet(self, task_id):
         subnetwork = -1
-        for subnet, task_list in self.task_by_subnet.items():
+        for subnet, task_list in self.tasks_by_subnet.items():
             print("Checking subnet {} and task_list {}".format(subnet, task_list))
             if task_id in task_list:
                 subnetwork = subnet
         
-        if len(self.task_by_subnet.keys()) == 0:
+        if len(self.tasks_by_subnet.keys()) == 0:
             subnetwork = 0
-            self.task_by_subnet[0] = [task_id]
+            self.tasks_by_subnet[0] = [task_id]
         elif subnetwork == -1:
-            subnetwork = max(self.task_by_subnet.keys()) + 1
-            self.task_by_subnet[subnetwork] = [task_id]
+            subnetwork = max(self.tasks_by_subnet.keys()) + 1
+            self.tasks_by_subnet[subnetwork] = [task_id]
 
         print("Selecting subnetwork: ", subnetwork, " for task ID: ", task_id)
         return subnetwork
@@ -95,9 +322,12 @@ class MoACLIP(_Trainer):
         ### Add experts and router for new task and corresponding dictionary entries to track subnetwork-dedicated experts
         if subnet not in self.experts_by_subnet.keys():
             self.experts_by_subnet[subnet] = {"text":{}, "visual":{}}
+            self.experts_index_by_subnet[subnet] = {"text":{}, "visual":{}}
             for i in range(len(self.model.clip_model.visual.transformer.resblocks)):
                 self.experts_by_subnet[subnet]['text'][i] = []
                 self.experts_by_subnet[subnet]['visual'][i] = []
+                self.experts_index_by_subnet[subnet]['text'][i] = []
+                self.experts_index_by_subnet[subnet]['visual'][i] = []
                 ### Set up new routers for new task in all transformer residual blocks
                 self.model.clip_model.visual.transformer.resblocks[i].init_subnet(subnet)
                 self.model.clip_model.transformer.resblocks[i].init_subnet(subnet)
@@ -149,22 +379,28 @@ class MoACLIP(_Trainer):
             top_values_v, top_indices_v = torch.topk(visual_choose_map, 2)
             top_values_t, top_indices_t = torch.topk(text_choose_map, 2)
 
+            indices_for_task, visual_indices_for_task = [], []
             for j in range(len(top_indices_v)):
+                visual_indices_for_task.append(top_indices_v[j].item())
                 self.experts_by_subnet[self.subnet]["visual"][i].append('visual.transformer.resblocks.{}.adaptmlp_list.{}.down_proj.weight'.format(i,top_indices_v[j]))
                 self.experts_by_subnet[self.subnet]["visual"][i].append('visual.transformer.resblocks.{}.adaptmlp_list.{}.down_proj.bias'.format(i,top_indices_v[j]))
                 self.experts_by_subnet[self.subnet]["visual"][i].append('visual.transformer.resblocks.{}.adaptmlp_list.{}.up_proj.weight'.format(i,top_indices_v[j]))
                 self.experts_by_subnet[self.subnet]["visual"][i].append('visual.transformer.resblocks.{}.adaptmlp_list.{}.up_proj.bias'.format(i,top_indices_v[j]))
             for k in range(len(top_indices_t)):
+                indices_for_task.append(top_indices_t[k].item())
                 self.experts_by_subnet[self.subnet]["text"][i].append('transformer.resblocks.{}.adaptmlp_list.{}.down_proj.weight'.format(i, top_indices_t[k]))
                 self.experts_by_subnet[self.subnet]["text"][i].append('transformer.resblocks.{}.adaptmlp_list.{}.down_proj.bias'.format(i, top_indices_t[k]))
                 self.experts_by_subnet[self.subnet]["text"][i].append('transformer.resblocks.{}.adaptmlp_list.{}.up_proj.weight'.format(i, top_indices_t[k]))
                 self.experts_by_subnet[self.subnet]["text"][i].append('transformer.resblocks.{}.adaptmlp_list.{}.up_proj.bias'.format(i, top_indices_t[k]))
 
+            ### Tracks each task's indices as individual lists so they can be differentiated during merging
+            self.experts_index_by_subnet[self.subnet]["visual"][i].extend(visual_indices_for_task)
+            self.experts_index_by_subnet[self.subnet]["text"][i].extend(indices_for_task)
 
 
-    if len(self.task_by_subnet.keys()) > self.args.max_subnets:
-        self.merge_subnetworks()
 
+        if len(self.tasks_by_subnet.keys()) > self.max_subnets:
+            self.cluster_and_merge()
 
 
 
@@ -184,7 +420,7 @@ class MoACLIP(_Trainer):
 
 
         self.memory_sampler = MemorySubnetBatchSampler(self.memory, self.memory_batchsize,
-                                    self.temp_batchsize * self.online_iter * self.world_size, self.task_by_subnet[self.subnet])
+                                    self.temp_batchsize * self.online_iter * self.world_size, self.tasks_by_subnet[self.subnet])
         self.memory_dataloader = DataLoader(self.train_dataset,
                                             batch_size=self.memory_batchsize,
                                             sampler=self.memory_sampler,
@@ -373,7 +609,8 @@ class MoACLIP(_Trainer):
                 y = y.to(self.device)
                 current_sample_count += len(y)
 
-                logit, _, _ = self.model(x, is_train=False, val_task_id=self.task_id)
+                # logit, _, _ = self.model(x, is_train=False, val_task_id=self.task_id)
+                logit, _, _ = self.model(x, is_train=False, val_task_id=self.subnet)
                 pred = torch.argmax(logit, dim=-1)
                 _, preds = logit.topk(self.topk, 1, True, True)
                 total_correct += torch.sum(preds == y.unsqueeze(1)).item()
