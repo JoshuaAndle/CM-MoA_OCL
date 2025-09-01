@@ -202,7 +202,7 @@ class OnlineSampler(Sampler):
 
 
 
-
+### A sampler for online training with the provided multiDataset class in /datasets/multiDataset.py
 class OnlineMultiDatasetSampler(Sampler):
 
     def __init__(self,

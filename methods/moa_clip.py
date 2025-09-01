@@ -16,10 +16,11 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 import torchvision.models as models
+from torchvision import transforms
 
 from methods._trainer import _Trainer
 from utils.train_utils import select_optimizer, select_scheduler, exp_lr_scheduler
-from utils.memory import Memory, MemoryBatchSampler, MemorySubnetBatchSampler
+from utils.memory import Memory, MemoryBatchSampler, MemorySubnetBatchSampler, MemorySubnetSampler
 # from utils.memory import MemoryBatchSampler
 
 from models.AutoEncoder import AutoEncoder, Alexnet_FE
@@ -63,7 +64,6 @@ class MoACLIP(_Trainer):
 
 
 
-
     def merge_subnetworks(self, clustered_subnets):
         ### Add experts and router for new task and corresponding dictionary entries to track subnetwork-dedicated experts
         subnets_to_remove = []
@@ -99,8 +99,9 @@ class MoACLIP(_Trainer):
             experts_to_remove['visual'][i].sort()
             experts_to_remove['text'][i].sort()
 
-            self.model.clip_model.visual.transformer.resblocks[i].merge_subnets(clustered_subnets, experts_to_remove["visual"][i], verbose=(i<3))
-            self.model.clip_model.transformer.resblocks[i].merge_subnets(clustered_subnets, experts_to_remove["text"][i], verbose=(i<3))
+            print_first = 0
+            self.model.clip_model.visual.transformer.resblocks[i].merge_subnets(clustered_subnets, experts_to_remove["visual"][i], verbose=(i<print_first))
+            self.model.clip_model.transformer.resblocks[i].merge_subnets(clustered_subnets, experts_to_remove["text"][i], verbose=(i<print_first))
 
 
 
@@ -108,23 +109,35 @@ class MoACLIP(_Trainer):
 
         ### Remove subnets being merged from dicts
         ### experts_index_by_subnet, experts_by_subnet, task_by_subnet
-        for subnet in subnets_to_remove:
-            if subnet in self.experts_index_by_subnet.keys():
-                del self.experts_index_by_subnet[subnet]
-            if subnet in self.experts_by_subnet.keys():
-                del self.experts_by_subnet[subnet]
-            if subnet in self.tasks_by_subnet.keys():
-                ### Passes responsibility of the merged tasks to the subnetwork being merged into
-                self.tasks_by_subnet[clustered_subnets[0]].extend(self.tasks_by_subnet[subnet])
-                del self.tasks_by_subnet[subnet]
+        # for subnet in subnets_to_remove:
+        #     if subnet in self.experts_index_by_subnet.keys():
+        #         del self.experts_index_by_subnet[subnet]
+        #     if subnet in self.experts_by_subnet.keys():
+        #         del self.experts_by_subnet[subnet]
+        #     if subnet in self.tasks_by_subnet.keys():
+        #         ### Passes responsibility of the merged tasks to the subnetwork being merged into
+        #         self.tasks_by_subnet[clustered_subnets[0]].extend(self.tasks_by_subnet[subnet])
+        #         del self.tasks_by_subnet[subnet]
 
 
 
         ### Remap subnet IDs to be contiguous
         offset = 0
         for subnet in range(max(list(self.tasks_by_subnet.keys())) + 1):
+            ### Remove subnet from dict keys and offset remaining subnet IDs
             if subnet in subnets_to_remove:
                 offset += 1
+                if subnet in self.experts_index_by_subnet.keys():
+                    del self.experts_index_by_subnet[subnet]
+                if subnet in self.experts_by_subnet.keys():
+                    del self.experts_by_subnet[subnet]
+                if subnet in self.tasks_by_subnet.keys():
+                    ### Passes responsibility of the merged tasks to the subnetwork being merged into
+                    self.tasks_by_subnet[clustered_subnets[0]].extend(self.tasks_by_subnet[subnet])
+                    del self.tasks_by_subnet[subnet]
+
+
+
             else:
                 if offset > 0:
                     self.tasks_by_subnet[subnet-offset] = self.tasks_by_subnet[subnet]
@@ -136,7 +149,7 @@ class MoACLIP(_Trainer):
 
 
 
-        print("experts_to_remove: ", experts_to_remove)
+        # print("experts_to_remove: ", experts_to_remove)
 
         ### Offset all dicts to reflect new expert IDs
         ### Note: End result is all subnet and expert IDs are contiguous integers to match the list indexing used in the CLIP model
@@ -145,14 +158,16 @@ class MoACLIP(_Trainer):
             for mode in ['text', 'visual']:
                 for block in self.experts_index_by_subnet[subnet][mode].keys():
             
-                    offset = 0
                     temp_expert_name_list, temp_index_list = [], []
                     for expert in self.experts_index_by_subnet[subnet][mode][block]:
                         ### Offset IDs and skip if the expert is being removed
-                        print("Checking expert {} against experts to remove: {}".format(expert, experts_to_remove[mode][block]))
+                        # if block == 0 and mode == "visual":
+                        #     print("Checking expert {} against experts to remove: {}".format(expert, experts_to_remove[mode][block]))
+                        offset = 0
                         for removed_expert in experts_to_remove[mode][block]:
                             if expert > removed_expert:
-                                print("Removing, incrementing offset")
+                                # if block == 0 and mode == "visual":
+                                #     print("Removing, incrementing offset")
                                 offset += 1
 
                         if expert in experts_to_remove[mode][block]:
@@ -207,8 +222,82 @@ class MoACLIP(_Trainer):
         print("Clusters for subnets {}: {}".format(self.tasks_by_subnet.keys(), clusters))
         return clusters
 
+
+    ### Finetune a given subnetwork on its corresponding memory data
     def finetune_subnets(self, subnet):
-        pass
+
+        ### Reset frozen parameters
+        for k, v in self.model.named_parameters():
+            v.requires_grad = True
+
+        self.online_before_task(manual_subnet=subnet)
+
+
+        if self.visible_classes == 'batch':
+            # batch
+            train_class_list = self.batch_exposed_classes
+            train_class_name_list = self.batch_exposed_classes_names
+
+        else:
+            # all
+            train_class_list = self.exposed_classes
+            train_class_name_list = self.exposed_classes_names
+
+
+        self.memory_sampler = MemorySubnetSampler(self.memory, self.tasks_by_subnet[self.subnet])
+        self.memory_dataloader = DataLoader(self.train_dataset,
+                                            batch_size=self.memory_batchsize,
+                                            sampler=self.memory_sampler,
+                                            num_workers=4)
+
+        self.model.train()
+
+        ### If there is a memory buffer, we also do a batch of memory samples
+        ### We do this in two passes rather than concatenate batches since datasets may have incompatible sizes of images
+        for epoch in range(30):
+            print("Finetuning epoch: ", epoch)
+            self.update_schedule(reset=True)
+            total_loss, total_correct, total_num_data = 0.0, 0.0, 0.0
+
+            for idx, (images, labels) in enumerate(self.memory_dataloader):
+                for i in labels.unique():
+                    if i not in train_class_list:
+                        train_class_list.append(i)
+                        train_class_name_list.append(self.exposed_classes_names[self.exposed_classes.index(i)])
+
+                for i in range(len(labels)):
+                    labels[i] = train_class_list.index(labels[i].item())
+
+                images, labels = images.to(self.device), labels.to(self.device)
+                # images = self.train_transform(images)
+                text_tokens = self.model.labels_tokenize(train_class_name_list)
+
+
+                ### Train clip model adapters
+                # with torch.cuda.amp.autocast(enabled=self.use_amp):
+                with torch.amp.autocast('cuda', enabled=self.use_amp):            
+                    logit, image_features, text_features = self.model(images, text_tokens)
+                    loss = self.criterion(logit, labels)
+                _, preds = logit.topk(self.topk, 1, True, True)
+
+                ### Accumulate gradients with the online batch and memory batch before zeroing again
+                self.optimizer.zero_grad()
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+
+
+                total_loss += loss.item()
+                total_correct += torch.sum(preds == labels.unsqueeze(1)).item()
+                total_num_data += labels.size(0)
+                
+            self.report_training(total_num_data, total_loss / total_num_data, total_correct / total_num_data)
+
+            self.update_schedule()
+
+
+
+
 
     ### Cluster the subnetworks by connectivity with KNN clustering, then merge as needed to have K subnetworks
     def cluster_and_merge(self):
@@ -306,18 +395,22 @@ class MoACLIP(_Trainer):
 
 
     ### Prior to task, set task ID in model and initialize new expert mask, task routers, and task autoencoder
-    def online_before_task(self, task_id):
+    def online_before_task(self, task_id=None, manual_subnet=None):
         ### Deferred assignment since self.device isnt set up at init
         self.feature_extractor.to(self.device)
 
         self.autoencoders[task_id] = AutoEncoder()
         self.optimizer_encoder = optim.Adam(self.autoencoders[task_id].parameters(), lr=0.003, weight_decay=0.0001)
 
+        if manual_subnet == None:
+            subnet = self.select_subnet(task_id)
+        else:
+            subnet = manual_subnet
 
-        subnet = self.select_subnet(task_id)
         self.subnet = subnet
         self.memory.set_task(task_id)
         self.model.clip_model.set_subnet(subnet)
+
 
         ### Add experts and router for new task and corresponding dictionary entries to track subnetwork-dedicated experts
         if subnet not in self.experts_by_subnet.keys():
@@ -366,18 +459,18 @@ class MoACLIP(_Trainer):
 
     def online_after_task(self, task_id):
         
-        print("Memory buffer length after training: ", self.memory.labels.shape)
-        print("Memory buffer labels: ", self.memory.labels.unique())
+        # print("Memory buffer length after training: ", self.memory.labels.shape)
+        # print("Memory buffer labels: ", self.memory.labels.unique())
         sorted_counts = dict(sorted(self.memory.cls_count.items(), key=lambda item: item[1], reverse=True))
-        print("Memory class counts: ", sorted_counts)
+        # print("Memory class counts: ", sorted_counts)
 
 
         ### Assign the most-used experts for the current task for freezing
         for i in range(len(self.model.clip_model.visual.transformer.resblocks)):
             visual_choose_map = self.model.clip_model.visual.transformer.resblocks[i].choose_map_image
             text_choose_map = self.model.clip_model.transformer.resblocks[i].choose_map_text
-            top_values_v, top_indices_v = torch.topk(visual_choose_map, 2)
-            top_values_t, top_indices_t = torch.topk(text_choose_map, 2)
+            top_values_v, top_indices_v = torch.topk(visual_choose_map, 3)
+            top_values_t, top_indices_t = torch.topk(text_choose_map, 3)
 
             indices_for_task, visual_indices_for_task = [], []
             for j in range(len(top_indices_v)):
@@ -397,7 +490,20 @@ class MoACLIP(_Trainer):
             self.experts_index_by_subnet[self.subnet]["visual"][i].extend(visual_indices_for_task)
             self.experts_index_by_subnet[self.subnet]["text"][i].extend(indices_for_task)
 
+            ### Report frozen expert indices back to the CLIP adapter layer
+            self.model.clip_model.visual.transformer.resblocks[i].frozen_experts[self.subnet].extend(visual_indices_for_task)
+            self.model.clip_model.transformer.resblocks[i].frozen_experts[self.subnet].extend(indices_for_task)
 
+            for j in visual_indices_for_task:
+                if j not in self.model.clip_model.visual.transformer.resblocks[i].frozen_experts['all']:
+                    self.model.clip_model.visual.transformer.resblocks[i].frozen_experts['all'].extend(visual_indices_for_task)
+
+            for k in indices_for_task:
+                if k not in self.model.clip_model.transformer.resblocks[i].frozen_experts['all']:
+                    self.model.clip_model.transformer.resblocks[i].frozen_experts['all'].extend(indices_for_task)
+
+            if i == 0:
+                print("Reporting visual and text frozen expert indices for block 0: {} - {}".format(visual_indices_for_task, indices_for_task))
 
         if len(self.tasks_by_subnet.keys()) > self.max_subnets:
             self.cluster_and_merge()
@@ -465,7 +571,7 @@ class MoACLIP(_Trainer):
             y[j] = train_class_list.index(y[j].item())
 
         x,y = x.to(self.device), y.to(self.device)
-        x = self.train_transform(x)
+        # x = self.train_transform(x)
 
 
 
@@ -546,7 +652,7 @@ class MoACLIP(_Trainer):
                     y_mem[j] = train_class_list.index(y_mem[j].item())
 
                 x_mem, y_mem = x_mem.to(self.device), y_mem.to(self.device)
-                x_mem = self.train_transform(x_mem)
+                # x_mem = self.train_transform(x_mem)
 
 
 
@@ -685,6 +791,7 @@ class MoACLIP(_Trainer):
                 self.model.clip_model.set_task(task_id)
 
                 ### Evaluate using model set to the identified best-fit known task routing
+                #*# Needs to be changed to reflect subnet use
                 logit, _, _ = self.model(x, text_tokens, is_train=False, val_task_id=task_id)
                 pred = torch.argmax(logit, dim=-1)
                 _, preds = logit.topk(self.topk, 1, True, True)
@@ -798,6 +905,28 @@ class MoACLIP(_Trainer):
     #             self.memory.replace_data([sample[i], label[i].item()])
 
 
+    ### Apply train transform directly in dataset
+    def setup_dataset(self):
+        # get dataset
+
+        print("\nSetting up dataset with child class in moa_clip.py")
+
+
+        self.train_transform = transforms.Compose([
+            transforms.ToTensor(),
+            *self.train_transform.transforms
+        ])
+        # print("Using transform: ", self.train_transform)
+
+        ### Gets the standard torchvision dataset for applicable datasets
+        self.train_dataset = self.dataset(root=self.data_dir,
+                                          train=True,
+                                          download=True,
+                                          transform=self.train_transform)
+        self.test_dataset = self.dataset(root=self.data_dir,
+                                         train=False,
+                                         download=True,
+                                         transform=self.test_transform)
 
 
 
