@@ -317,10 +317,12 @@ class ResidualAttentionBlock_MoA(ResidualAttentionBlock):
         self.d_model=d_model
 
 
+        self.frozen_experts = {"all":[]}
         self.adaptmlp_list = nn.ModuleList()
         self.router_list = nn.ParameterList()
         self.w_noise_list = nn.ParameterList()
             
+
         for i in range(self.experts_num):  #  Expert number
             self.adaptmlp = Adapter(d_model=d_model, dropout=0.1, bottleneck=self.ffn_num,
                                     init_option='lora',
@@ -344,12 +346,27 @@ class ResidualAttentionBlock_MoA(ResidualAttentionBlock):
             print("Merging Subnetworks in adapter layer")
             print("Pre-merge layer has {} adapters and {} routers. Removing experts: {}".format(len(self.adaptmlp_list), len(self.router_list), experts_to_remove))
             print("Pre-merge size of router: ", self.router_list[0].data.size())
+            print("Pre-merge frozen experts: ", self.frozen_experts)
+
+
+
+        ### Unlist frozen experts for subnetworks being removed and remap subnet keys to be contiguous
+        offset = 0
+        for subnet in range(len(self.router_list)):
+            if subnet in subnet_list[1:]:
+                offset += 1
+                del self.frozen_experts[subnet]
+            else:
+                if offset > 0:
+                    self.frozen_experts[subnet-offset] = self.frozen_experts[subnet]
+                    del self.frozen_experts[subnet]
+
+
 
         ### Remove the routers of subnetworks being merged:
         remaining_subnets = [i for i in range(len(self.router_list)) if i not in subnet_list[1:]]
         self.router_list = nn.ParameterList([self.router_list[i] for i in remaining_subnets])
         self.w_noise_list = nn.ParameterList([self.w_noise_list[i] for i in remaining_subnets])
-
 
         ### Downsize the routers to account for removal of experts deemed redundant
         remaining_experts = [i for i in range(len(self.adaptmlp_list)) if i not in experts_to_remove]
@@ -364,9 +381,41 @@ class ResidualAttentionBlock_MoA(ResidualAttentionBlock):
         self.adaptmlp_list = nn.ModuleList([self.adaptmlp_list[i] for i in remaining_experts])
         self.experts_num -= len(experts_to_remove)
 
+        # print("Frozen experts after removing subnets: ", self.frozen_experts)
+
+        remaining_frozen_experts = []
+        for expert in self.frozen_experts["all"]:
+            if expert in remaining_experts:
+                remaining_frozen_experts.append(expert)
+        self.frozen_experts["all"] = remaining_frozen_experts
+
+        # print("Frozen experts after modifying all key: ", self.frozen_experts)
+
+
+        ### Need to remap the expert IDs for frozen_experts to account for removed experts
+        for key in self.frozen_experts.keys():
+            temp_index_list = []
+
+            for expert in self.frozen_experts[key]:
+                offset = 0
+
+                if expert in experts_to_remove:
+                    continue
+
+                for removed_expert in experts_to_remove:
+                    if expert > removed_expert:
+                        offset += 1
+
+
+                temp_index_list.append(expert-offset)
+
+            self.frozen_experts[key] = temp_index_list
+
+
         if verbose:
             print("Post-merge layer has {} adapters and {} routers. Removing experts: {}".format(len(self.adaptmlp_list), len(self.router_list), experts_to_remove))
             print("Post-merge size of router: ", self.router_list[0].data.size())
+            print("Resulting frozen experts: ", self.frozen_experts)
             print("Resulting experts_num: ", self.experts_num)
 
 
@@ -376,6 +425,7 @@ class ResidualAttentionBlock_MoA(ResidualAttentionBlock):
         self.init_expert(self.experts_per_task)
         self.router_list.append(nn.Parameter(torch.zeros(self.d_model, len(self.adaptmlp_list)), requires_grad=True))
         self.w_noise_list.append(nn.Parameter(torch.zeros(self.d_model, len(self.adaptmlp_list)), requires_grad=True))
+        self.frozen_experts[subnet] = []
 
     def init_expert(self, num_experts_added=1):
         ### Add new experts to accomodate learning new task
@@ -479,7 +529,7 @@ class ResidualAttentionBlock_MoA(ResidualAttentionBlock):
         prob = torch.where(is_in, prob_if_in, prob_if_out)
         return prob
 
-    def noisy_top_k_gating(self, x, train, w_gate, w_noise, noise_epsilon=1e-2):
+    def noisy_top_k_gating(self, x, train, w_gate, w_noise, subnet, noise_epsilon=1e-2):
         """Noisy top-k gating.
           See paper: https://arxiv.org/abs/1701.06538.
           Args:
@@ -501,7 +551,27 @@ class ResidualAttentionBlock_MoA(ResidualAttentionBlock):
         else:
             logits = clean_logits
         # calculate topk + 1 that will be needed for the noisy gates
-        # print("Shape of noisy logits: ", logits.shape)
+        # print("\nShape of noisy logits: ", logits.shape)
+        # if self.modal != "text":
+        #     print("Frozen experts: ", self.frozen_experts)
+        ### Mask the router to avoid routing to experts frozen for other subnetworks
+        frozen_mask = torch.ones(logits.shape).to(x)
+        ### If there are frozen experts dedicated to the subnet, only route to them
+        if len(self.frozen_experts[subnet]) > 0:
+            global global_subnet_id
+            frozen = [i for i in range(len(self.adaptmlp_list)) if i not in self.frozen_experts[subnet]]
+            # if self.modal != "text":
+            #     print("setting frozen with nonzero subnet {} and global_subnet_id {} experts {}".format(subnet, global_subnet_id, self.frozen_experts[subnet]))
+        ### If no experts have been frozen yet for this subnet, use all unfrozen experts 
+        else:
+            frozen = [i for i in self.frozen_experts["all"]]
+
+        frozen_mask[:, frozen] = 0
+        # if self.modal != "text":
+        #     print("Resulting frozen mask marginal: ", frozen_mask.sum(dim=0))
+
+        logits = logits * frozen_mask
+
 
         ### Gets the top router logits for each sample in the batch, corresponding to which expert to pass the sample to
         top_logits, top_indices = logits.topk(min(self.top_k + 1, self.experts_num), dim=1)
@@ -534,10 +604,13 @@ class ResidualAttentionBlock_MoA(ResidualAttentionBlock):
 
             x_re = x.permute(1, 0, 2)[:,0,:]
 
-            if global_val_subnet_id != None:
-                gates, load = self.noisy_top_k_gating(x_re, is_train, self.router_list[global_val_subnet_id], self.w_noise_list[global_val_subnet_id])
+            if is_train == False and global_val_subnet_id != None:
+                gates, load = self.noisy_top_k_gating(x_re, is_train, self.router_list[global_val_subnet_id], self.w_noise_list[global_val_subnet_id], global_val_subnet_id)
+            elif global_subnet_id != None:
+                gates, load = self.noisy_top_k_gating(x_re, is_train, self.router_list[global_subnet_id], self.w_noise_list[global_subnet_id], global_subnet_id)
             else:
-                gates, load = self.noisy_top_k_gating(x_re, is_train, self.router_list[global_subnet_id], self.w_noise_list[global_subnet_id])
+                print("Incorrect setting in forward call for CLIP model global subnet IDs")
+
             importance = gates.sum(0)
 
             #!# Note: Original MoE-Adapter author never implemented a penalty for this loss
@@ -785,6 +858,7 @@ class CLIP(nn.Module):
     def set_subnet(self, subnet_id):
         global global_subnet_id 
         global_subnet_id = subnet_id
+        print("\nGlobal_subnet_id set to ", global_subnet_id)
 
     def initialize_parameters(self):
         nn.init.normal_(self.token_embedding.weight, std=0.02)
