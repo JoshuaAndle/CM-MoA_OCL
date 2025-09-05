@@ -585,6 +585,10 @@ class ResidualAttentionBlock_MoA(ResidualAttentionBlock):
 
         ### Apply the softmax logits to the corresponding selected top_k indices
         gates = zeros.scatter(1, top_k_indices, top_k_gates)
+        # if self.modal != "text":
+        #     print("Gates shape: ", gates.shape)
+        #     print(gates)
+
         if self.noisy_gating and self.top_k < self.experts_num and train:
             load = (self._prob_in_top_k(clean_logits, noisy_logits, noise_stddev, top_logits)).sum(0)
         else:
@@ -629,9 +633,14 @@ class ResidualAttentionBlock_MoA(ResidualAttentionBlock):
                 else:
                     self.choose_map_image[number] = self.choose_map_image[number] + count
 
-
+            ### Note: This dispatches a subset of samples to their corresponding top-k selected experts from the gates
             dispatcher = SparseDispatcher(self.experts_num, gates)
+            # print("x shape before dispatch: {}".format(x.shape))
             expert_inputs = dispatcher.dispatch(x.permute(1, 0, 2).view(x.shape[1], -1))
+
+            # if self.modal == "text":
+                # print("Expert inputs before and after reshaping: {} and {}".format(expert_inputs.shape, 
+                #                                                                 expert_inputs[0].view(expert_inputs[0].shape[0],x.shape[0],x.shape[2])))
 
             expert_outputs = [self.adaptmlp_list[i](expert_inputs[i].view(expert_inputs[i].shape[0], x.shape[0],x.shape[2]).to(x), 
                                                     add_residual=False) 
@@ -643,9 +652,11 @@ class ResidualAttentionBlock_MoA(ResidualAttentionBlock):
                     expert_outputs.pop(i)
                 else:
                     expert_outputs[i] = expert_outputs[i].view(expert_outputs[i].shape[0],-1)
+                    # print("expert_outputs {} shape: {}".format(i, expert_outputs[i].shape))
                     i += 1
 
             y = dispatcher.combine(expert_outputs)
+            # print("combined dispatcher output before {} and after view {}".format(y.shape, y.view(x.shape[1], x.shape[0], x.shape[2]).shape))
             y = y.view(x.shape[1],x.shape[0],x.shape[2])
             x = x + self.mlp(self.ln_2(x)) + y.permute(1, 0, 2)
                   
@@ -709,7 +720,7 @@ class Transformer(nn.Module):
         super().__init__()
         self.width = width
         self.layers = layers
-
+        self.modal = modal
         self.res_type = design_details.get('method', 'vanilla')
         peft_flag = design_details.get('peft_encoder','none') in ['both', modal]
 
@@ -726,6 +737,7 @@ class Transformer(nn.Module):
     def forward(self, x: torch.Tensor, is_train=True):
         if self.res_type == "moe":
             for block in self.resblocks:
+                # print("Text x shape in {} transformer: {}".format(self.modal, x.shape))
                 x = block(x, is_train)
             return x
         else:
@@ -813,6 +825,7 @@ class CLIP(nn.Module):
 
         ### Manually passed per-method args
         self.design_details = design_details
+        print("CLIP embed dim: ", embed_dim)
 
         if isinstance(vision_layers, (tuple, list)):
             vision_heads = vision_width * 32 // 64
@@ -916,10 +929,15 @@ class CLIP(nn.Module):
             global global_val_subnet_id
             global_val_subnet_id = val_text_subnet_id
         
+
+        # print("--Encoding text--")
+        # print("Text shape: ", text.shape)
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
 
         x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
+
+        # print("Text permuted w/ positional embedding shape: ", x.shape)
         x = self.transformer(x, is_train)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
@@ -936,6 +954,8 @@ class CLIP(nn.Module):
             return self.encode_text(text, is_train, val_subnet_id)
         elif text is None:
             return self.encode_image(image, is_train, val_subnet_id)
+
+        # print("Shapes of image and text inputs to CLIP: {} and {}".format(image.shape, text.shape))
         image_features = self.encode_image(image, is_train, val_subnet_id)
         text_features = self.encode_text(text, is_train, val_subnet_id)
 
@@ -990,6 +1010,8 @@ def build_model(state_dict: dict, design_details: dict):
         vision_patch_size = None
         assert output_width**2 + 1 == state_dict["visual.attnpool.positional_embedding"].shape[0]
         image_resolution = output_width * 32
+
+
 
     embed_dim = state_dict["text_projection"].shape[1]
     context_length = state_dict["positional_embedding"].shape[0]
