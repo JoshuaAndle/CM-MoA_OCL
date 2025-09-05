@@ -70,7 +70,9 @@ class MoACLIP(nn.Module):
         if isinstance(labels, str):
             labels = [labels]
 
+
         texts = [self.prompt_template.format(c) for c in labels]
+        # print("\nTokenization input: ", texts)
 
         sot_token = _tokenizer.encoder["<start_of_text>"]
         eot_token = _tokenizer.encoder["<end_of_text>"]

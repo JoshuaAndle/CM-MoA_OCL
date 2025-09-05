@@ -1,4 +1,5 @@
 import math
+import random
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
@@ -66,7 +67,7 @@ class Memory:
         class_indices = (self.labels == cls).nonzero(as_tuple=True)[0]
         random_removal_indices = torch.randperm(len(class_indices))
         ### Shuffle the indices corresponding to given class, then take the first ones to be removed
-        print("Removing excess_count {} from cls: {}".format(excess_count, cls))
+        # print("Removing excess_count {} from cls: {}".format(excess_count, cls))
         random_removal_indices = class_indices[random_removal_indices][:excess_count]
 
         kept_indices = torch.arange(len(self.labels))
@@ -82,7 +83,7 @@ class Memory:
             excess_count = self.cls_count[cls.item()] - self.memory_per_class
             if excess_count > 0:
                 self.remove_samples(cls, excess_count)
-        print("Class counts after resizing: ", self.cls_count)
+        # print("Class counts after resizing: ", self.cls_count)
 
 
 
@@ -177,6 +178,43 @@ class DummyMemory(Memory):
 
 
 
+
+class MemorySubnetSampler(torch.utils.data.Sampler):
+    def __init__(self, memory: Memory, tasks: list = [], shuffle: bool = False) -> None:
+        self.memory = memory
+        self.shuffle = shuffle
+
+        valid_classes = []
+        for task in tasks:
+            valid_classes.extend(self.memory.classes_by_task[task])
+
+        ### Get only the labels corresponding to the given subnetwork, if one is given
+        if len(valid_classes) > 0:
+            valid_indices = torch.isin(self.memory.labels, torch.tensor(valid_classes))
+            valid_indices = valid_indices.nonzero(as_tuple=True)[0]
+            # print("Number of valid indices for subnetwork tasks {} in memory: {}".format(tasks, len(valid_indices)))
+        else:
+            valid_indices = torch.tensor(len(self.memory), dtype=torch.int64)
+
+        self.indices = valid_indices.tolist()
+        for i, idx in enumerate(self.indices):
+            self.indices[i] = int(self.memory.memory[idx])
+    
+    def __iter__(self):
+        shuffled_indices = self.indices[:]
+        if self.shuffle == True:
+            random.shuffle(shuffled_indices)
+
+        return iter(shuffled_indices)
+
+
+    def __len__(self):
+        return len(self.indices)
+    
+
+
+
+
 class MemorySubnetBatchSampler(torch.utils.data.Sampler):
     def __init__(self, memory: Memory, batch_size: int, iterations: int = 1, tasks: list = []) -> None:
         self.memory = memory
@@ -186,18 +224,23 @@ class MemorySubnetBatchSampler(torch.utils.data.Sampler):
         valid_classes = []
         for task in tasks:
             valid_classes.extend(self.memory.classes_by_task[task])
-        ### Get a random shuffle of only the labels corresponding to the given subnetwork, if one is given
+
+        ### Get only the labels corresponding to the given subnetwork, if one is given
         if len(valid_classes) > 0:
             valid_indices = torch.isin(self.memory.labels, torch.tensor(valid_classes))
             valid_indices = valid_indices.nonzero(as_tuple=True)[0]
-            print("Number of valid indices for subnetwork tasks {} in memory: {}".format(tasks, len(valid_indices)))
-            rand_indices = torch.randperm(len(valid_indices), dtype=torch.int64)
-            shuffled_indices = valid_indices[rand_indices]
+            # print("Number of valid indices for subnetwork tasks {} in memory: {}".format(tasks, len(valid_indices)))
         else:
-            shuffled_indices = torch.randperm(len(self.memory), dtype=torch.int64)
+            valid_indices = torch.tensor(len(self.memory), dtype=torch.int64)
+
+        ### Shuffle the indices for each iteration that the sampler is used for
+        concat_indices = []
+        for _ in range(self.iterations):
+            shuffled_indices = valid_indices[torch.randperm(len(valid_indices), dtype=torch.int64)]
+            concat_indices.append(shuffled_indices[:min(self.batch_size, len(self.memory))])
 
 
-        self.indices = torch.cat([shuffled_indices[:min(self.batch_size, len(self.memory))] for _ in range(self.iterations)]).tolist()
+        self.indices = torch.cat(concat_indices).tolist()
         for i, idx in enumerate(self.indices):
             self.indices[i] = int(self.memory.memory[idx])
     

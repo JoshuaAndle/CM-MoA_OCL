@@ -22,7 +22,7 @@ from methods._trainer import _Trainer
 from utils.train_utils import select_optimizer, select_scheduler, exp_lr_scheduler
 from utils.memory import Memory, MemoryBatchSampler, MemorySubnetBatchSampler, MemorySubnetSampler
 # from utils.memory import MemoryBatchSampler
-
+from utils import connectivity
 from models.AutoEncoder import AutoEncoder, Alexnet_FE
 
 logger = logging.getLogger()
@@ -244,7 +244,8 @@ class MoACLIP(_Trainer):
             train_class_name_list = self.exposed_classes_names
 
 
-        self.memory_sampler = MemorySubnetSampler(self.memory, self.tasks_by_subnet[self.subnet])
+        #*# Note: Sampling from train_dataset may not work for multitask datasets? Need to double check
+        self.memory_sampler = MemorySubnetSampler(self.memory, self.tasks_by_subnet[self.subnet], shuffle=True)
         self.memory_dataloader = DataLoader(self.train_dataset,
                                             batch_size=self.memory_batchsize,
                                             sampler=self.memory_sampler,
@@ -412,6 +413,7 @@ class MoACLIP(_Trainer):
         self.model.clip_model.set_subnet(subnet)
 
 
+
         ### Add experts and router for new task and corresponding dictionary entries to track subnetwork-dedicated experts
         if subnet not in self.experts_by_subnet.keys():
             self.experts_by_subnet[subnet] = {"text":{}, "visual":{}}
@@ -505,8 +507,24 @@ class MoACLIP(_Trainer):
             if i == 0:
                 print("Reporting visual and text frozen expert indices for block 0: {} - {}".format(visual_indices_for_task, indices_for_task))
 
+
         if len(self.tasks_by_subnet.keys()) > self.max_subnets:
             self.cluster_and_merge()
+
+
+        self.memory_sampler = MemorySubnetSampler(self.memory, self.tasks_by_subnet[self.subnet], shuffle=False)
+        self.memory_dataloader = DataLoader(self.train_dataset,
+                                            batch_size=self.memory_batchsize,
+                                            sampler=self.memory_sampler,
+                                            num_workers=4)
+
+
+
+        train_class_name_list = self.exposed_classes_names
+        text_tokens = self.model.labels_tokenize(train_class_name_list)
+        print("Text tokens shape: ", text_tokens.shape)
+        connectivity.activations(self.model.clip_model, text_tokens, data_loader=self.memory_dataloader, subnet=self.subnet)
+
 
 
 

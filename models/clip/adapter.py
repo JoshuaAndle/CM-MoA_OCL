@@ -53,6 +53,9 @@ class Adapter(nn.Module):
             x = self.adapter_layer_norm_before(x)
 
         down = self.down_proj(x)
+        ### Activations/inputs are shaped as [# routed batch samples, token length, embedding dimension]
+        ### print("Adapter fwd x shape {} and down shape {}: ".format(x.shape, down.shape))
+        ### Adapter fwd x shape torch.Size([18, 197, 768]) and down shape torch.Size([18, 197, 64]): 
         down = self.non_linear_func(down)
         down = nn.functional.dropout(down, p=self.dropout, training=self.training)
         up = self.up_proj(down)
